@@ -8,4 +8,4 @@ if [[ $# -ne 1 ]]; then
   exit 2
 fi
 
-exec python3 "$ROOT/patcher.py" "$1"
+exec python3 "$ROOT/beta_patcher.py" "$1"
