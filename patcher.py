@@ -135,75 +135,211 @@ def find_unique(root: pathlib.Path, name: str) -> pathlib.Path:
     return matches[0]
 
 
-def patch_lbtbtutil(path: pathlib.Path) -> None:
+def verify_lbtbtutil(path: pathlib.Path) -> None:
+    # Earlier versions of this patcher replaced LbtBTUtil's
+    # BluetoothDevice.isConnected() check with "MAC starts with C4:67:B5".
+    # That made every bonded Libratone speaker look connected and was removed:
+    # ARC mirrors ChromeOS's physical link state into isConnected(), so the
+    # app's original check is correct. We only verify the expected layout here.
     s = path.read_text()
     method = ".method private static final getConnectedBtDeviceList$getConnected"
     if method not in s:
-        sys.exit("Patch 1 guard failed: target method not found.")
-
-    method_pos = s.index(method)
-    start = s.find("    :try_start_0\n", method_pos)
-    end_marker = "    :try_end_0\n"
-    end = s.find(end_marker, start)
-    if start < 0 or end < 0:
-        sys.exit("Patch 1 guard failed: expected try block not found.")
-    end += len(end_marker)
-
-    original = s[start:end]
+        sys.exit("LbtBTUtil guard failed: target method not found.")
+    body = s[s.index(method):]
+    body = body[: body.index(".end method")]
     required = [
         'const-string v3, "isConnected"',
-        'Ljava/lang/reflect/Method;->invoke',
-        'Ljava/lang/Boolean;->booleanValue()Z',
+        "Ljava/lang/reflect/Method;->invoke",
+        "Ljava/lang/Boolean;->booleanValue()Z",
     ]
-    if not all(token in original for token in required):
-        sys.exit("Patch 1 guard failed: method body does not match Libratone 8.3.1 layout.")
+    if not all(token in body for token in required):
+        sys.exit("LbtBTUtil guard failed: method body does not match Libratone 8.3.1 layout.")
+    print("✓ LbtBTUtil left unmodified (original isConnected() check works under ARC)")
 
-    replacement = '''    :try_start_0
-    # ChromeOS/ARC compatibility patch #1:
-    # ARC may expose ChromeOS-connected Libratone devices as bonded while
-    # BluetoothDevice.isConnected() remains false. Libratone products use
-    # the C4:67:B5 OUI in this app's own isOurProduct() check.
-    invoke-virtual {v1}, Landroid/bluetooth/BluetoothDevice;->getAddress()Ljava/lang/String;
-    move-result-object v2
-    invoke-virtual {v2}, Ljava/lang/String;->toUpperCase()Ljava/lang/String;
-    move-result-object v2
-    const-string v3, "C4:67:B5"
-    invoke-virtual {v2, v3}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
-    move-result v2
-    if-eqz v2, :cond_0
-    invoke-static {v1}, Lkotlin/jvm/internal/Intrinsics;->checkNotNull(Ljava/lang/Object;)V
-    invoke-interface {v0, v1}, Ljava/util/List;->add(Ljava/lang/Object;)Z
-    :try_end_0
-'''
-    path.write_text(s[:start] + replacement + s[end:])
-    print("✓ Applied patch #1 (bonded Libratone devices count as connected candidates)")
+
+ARC_SYNC_METHOD = """# ChromeOS/ARC compatibility patch (arcSyncConnectedProducts):
+# Add bonded Libratone products that ARC reports as physically connected
+# (BluetoothDevice.isConnected(), mirrored from ChromeOS) and drop entries that
+# are no longer connected, so SPP auto-connect targets the speaker ChromeOS is
+# actually using instead of whichever bonded speaker the map yields first.
+.method public arcSyncConnectedProducts()V
+    .locals 9
+
+    invoke-virtual {p0}, Lcom/libratone/v3/luci/BlueToothUtil;->getBondedProductsList()Ljava/util/Set;
+
+    move-result-object v0
+
+    iget-object v1, p0, Lcom/libratone/v3/luci/BlueToothUtil;->lbtBTClassicConnectedManager:Lcom/libratone/v3/luci/BlueToothUtil$LbtBTClassicConnectedManager;
+
+    # v2 = addresses of bonded products that are physically connected
+    new-instance v2, Ljava/util/HashSet;
+
+    invoke-direct {v2}, Ljava/util/HashSet;-><init>()V
+
+    iget-object v8, v1, Lcom/libratone/v3/luci/BlueToothUtil$LbtBTClassicConnectedManager;->mListLbtBTClassicConnected:Ljava/util/concurrent/ConcurrentHashMap;
+
+    invoke-interface {v0}, Ljava/util/Set;->iterator()Ljava/util/Iterator;
+
+    move-result-object v0
+
+    :goto_add
+    invoke-interface {v0}, Ljava/util/Iterator;->hasNext()Z
+
+    move-result v3
+
+    if-eqz v3, :cond_add_done
+
+    invoke-interface {v0}, Ljava/util/Iterator;->next()Ljava/lang/Object;
+
+    move-result-object v3
+
+    check-cast v3, Landroid/bluetooth/BluetoothDevice;
+
+    invoke-virtual {v3}, Landroid/bluetooth/BluetoothDevice;->getAddress()Ljava/lang/String;
+
+    move-result-object v4
+
+    if-eqz v4, :goto_add
+
+    invoke-static {v3}, Lcom/libratone/v3/luci/ArcBtCompat;->isConnected(Landroid/bluetooth/BluetoothDevice;)Z
+
+    move-result v5
+
+    sget-object v6, Lcom/libratone/v3/luci/BlueToothUtil;->TAG:Ljava/lang/String;
+
+    new-instance v7, Ljava/lang/StringBuilder;
+
+    const-string p0, "arcSync "
+
+    invoke-direct {v7, p0}, Ljava/lang/StringBuilder;-><init>(Ljava/lang/String;)V
+
+    invoke-virtual {v7, v4}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    const-string p0, " connected="
+
+    invoke-virtual {v7, p0}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    invoke-virtual {v7, v5}, Ljava/lang/StringBuilder;->append(Z)Ljava/lang/StringBuilder;
+
+    invoke-virtual {v7}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+
+    move-result-object v7
+
+    invoke-static {v6, v7}, Lcom/libratone/v3/util/GTLog;->d(Ljava/lang/String;Ljava/lang/String;)V
+
+    if-eqz v5, :goto_add
+
+    invoke-interface {v2, v4}, Ljava/util/Set;->add(Ljava/lang/Object;)Z
+
+    # manager.add() ignores already-present keys and triggers SPP selection for new ones
+    invoke-virtual {v1, v4, v3}, Lcom/libratone/v3/luci/BlueToothUtil$LbtBTClassicConnectedManager;->add(Ljava/lang/String;Landroid/bluetooth/BluetoothDevice;)V
+
+    goto :goto_add
+
+    :cond_add_done
+    # drop entries that are no longer connected (or no longer bonded)
+    new-instance v0, Ljava/util/ArrayList;
+
+    invoke-virtual {v8}, Ljava/util/concurrent/ConcurrentHashMap;->keySet()Ljava/util/concurrent/ConcurrentHashMap$KeySetView;
+
+    move-result-object v3
+
+    invoke-direct {v0, v3}, Ljava/util/ArrayList;-><init>(Ljava/util/Collection;)V
+
+    invoke-virtual {v0}, Ljava/util/ArrayList;->iterator()Ljava/util/Iterator;
+
+    move-result-object v0
+
+    :goto_del
+    invoke-interface {v0}, Ljava/util/Iterator;->hasNext()Z
+
+    move-result v3
+
+    if-eqz v3, :cond_del_done
+
+    invoke-interface {v0}, Ljava/util/Iterator;->next()Ljava/lang/Object;
+
+    move-result-object v3
+
+    check-cast v3, Ljava/lang/String;
+
+    invoke-interface {v2, v3}, Ljava/util/Set;->contains(Ljava/lang/Object;)Z
+
+    move-result v4
+
+    if-nez v4, :goto_del
+
+    invoke-virtual {v1, v3}, Lcom/libratone/v3/luci/BlueToothUtil$LbtBTClassicConnectedManager;->del(Ljava/lang/String;)V
+
+    goto :goto_del
+
+    :cond_del_done
+    invoke-static {}, Lcom/libratone/v3/luci/ArcBtCompat;->ensureAclReceiver()V
+
+    return-void
+.end method
+
+"""
 
 
 def patch_bluetoothutil(path: pathlib.Path) -> None:
     s = path.read_text()
-    marker = '''    .line 255
+    marker = """    .line 255
     :cond_0
     iget-boolean p2, p0, Lcom/libratone/v3/luci/BlueToothUtil;->mIsBTConnectReveiverRegistered:Z
-'''
+"""
     if marker not in s:
-        sys.exit("Patch 2 guard failed: registerBTClassicReceiver insertion point not found.")
+        sys.exit("Patch guard failed: registerBTClassicReceiver insertion point not found.")
+    method_sig = ".method public registerBTClassicReceiver(Landroid/content/Context;Z)V"
+    if s.count(method_sig) != 1:
+        sys.exit("Patch guard failed: registerBTClassicReceiver signature not found exactly once.")
+    if "arcSyncConnectedProducts" in s:
+        sys.exit("Patch guard failed: BlueToothUtil already contains arcSyncConnectedProducts.")
+    required = [
+        ".field private static final TAG:Ljava/lang/String;",
+        ".field private final lbtBTClassicConnectedManager:Lcom/libratone/v3/luci/BlueToothUtil$LbtBTClassicConnectedManager;",
+        ".method public getBondedProductsList()Ljava/util/Set;",
+    ]
+    missing = [token for token in required if token not in s]
+    if missing:
+        sys.exit(f"Patch guard failed: BlueToothUtil is missing {missing}.")
 
-    replacement = '''    .line 255
+    replacement = """    .line 255
     :cond_0
 
-    # ChromeOS/ARC compatibility patch #2:
-    # ARC may not emit the Android A2DP CONNECTION_STATE_CHANGED broadcast
-    # Libratone expects. Seed the app's classic-connected manager from bonded
-    # Libratone products whenever this receiver path is initialized.
-    invoke-virtual {p0}, Lcom/libratone/v3/luci/BlueToothUtil;->getBondedProductsList()Ljava/util/Set;
-    move-result-object v1
-    iget-object v2, p0, Lcom/libratone/v3/luci/BlueToothUtil;->lbtBTClassicConnectedManager:Lcom/libratone/v3/luci/BlueToothUtil$LbtBTClassicConnectedManager;
-    invoke-virtual {v2, v1}, Lcom/libratone/v3/luci/BlueToothUtil$LbtBTClassicConnectedManager;->add(Ljava/util/Set;)V
+    # ChromeOS/ARC compatibility patch:
+    # ARC doesn't emit the A2DP CONNECTION_STATE_CHANGED broadcast Libratone
+    # expects, so sync the classic-connected manager with the bonded Libratone
+    # products that are actually connected (not every bonded product).
+    invoke-virtual {p0}, Lcom/libratone/v3/luci/BlueToothUtil;->arcSyncConnectedProducts()V
 
     iget-boolean p2, p0, Lcom/libratone/v3/luci/BlueToothUtil;->mIsBTConnectReveiverRegistered:Z
-'''
-    path.write_text(s.replace(marker, replacement, 1))
-    print("✓ Applied patch #2 (seed classic-connected manager from bonded products)")
+"""
+    s = s.replace(marker, replacement, 1)
+    s = s.replace(method_sig, ARC_SYNC_METHOD + method_sig, 1)
+    path.write_text(s)
+    print("✓ Patched BlueToothUtil (sync classic-connected manager with ARC-connected products)")
+
+
+def verify_connected_manager(path: pathlib.Path) -> None:
+    s = path.read_text()
+    required = [
+        ".field mListLbtBTClassicConnected:Ljava/util/concurrent/ConcurrentHashMap;",
+        ".method declared-synchronized add(Ljava/lang/String;Landroid/bluetooth/BluetoothDevice;)V",
+        ".method declared-synchronized del(Ljava/lang/String;)V",
+    ]
+    missing = [token for token in required if token not in s]
+    if missing:
+        sys.exit(f"Patch guard failed: LbtBTClassicConnectedManager is missing {missing}.")
+
+
+def add_arc_compat_class(bluetoothutil: pathlib.Path) -> None:
+    src = ROOT / "patches" / "ArcBtCompat.smali"
+    dest = bluetoothutil.parent / "ArcBtCompat.smali"
+    if dest.exists():
+        sys.exit(f"Patch guard failed: {dest} already exists in the decoded app.")
+    shutil.copy2(src, dest)
+    print("✓ Added ArcBtCompat (isConnected() helper + ACL connect/disconnect receiver)")
 
 
 def rebuild_dex(decoded: pathlib.Path) -> pathlib.Path:
@@ -329,8 +465,11 @@ def main() -> None:
 
     lbt = find_unique(decoded, "LbtBTUtil.smali")
     bt = find_unique(decoded, "BlueToothUtil.smali")
-    patch_lbtbtutil(lbt)
+    manager = find_unique(decoded, "BlueToothUtil$LbtBTClassicConnectedManager.smali")
+    verify_lbtbtutil(lbt)
+    verify_connected_manager(manager)
     patch_bluetoothutil(bt)
+    add_arc_compat_class(bt)
 
     # Avoid Apktool treating local backup files as unknown smali file types.
     for backup in decoded.rglob("*.smali.bak"):
